@@ -9,7 +9,6 @@ from matplotlib.widgets import Slider
 from scipy.special import spherical_jn, spherical_yn
 import warnings
 from multiprocessing import Pool, cpu_count
-from functools import partial
 warnings.filterwarnings('ignore')
 
 import tqdm
@@ -23,12 +22,12 @@ class SASModel:
         self.physical_aperture = 0.0254  # meters (1 inch)
         
         # System parameters
-        self.transducer_efficiency = 0.25  # Small AUV systems including all losses
+        self.transducer_efficiency = 0.25  # Small AUV systems including all electrical and mechanical losses
         self.hotel_load = 150  # W (SAS processing)
         self.detection_threshold = 30  # dB (SNR for reliable detection in ocean clutter and multipath)
-        self.bandwidth = 20000  # Hz (10 kHz bandwidth for range resolution)
+        self.bandwidth = 10000  # Hz 
         
-        # AUV parameters (keeping user-specified drag coefficient)
+        # AUV parameters
         self.seawater_density = 1027  # kg/m³
         self.frontal_area = 0.082  # m² (0.32m diameter AUV)
         self.drag_coefficient = 0.6  # Cylindrical with hemisphere nose
@@ -41,7 +40,7 @@ class SASModel:
         self.ph = 8.1  # typical seawater
         self.sea_state = 3  # moderate seas
         
-        # Frequency selection (Hz)
+        # SAS carrier frequencies for analysis (Hz)
         self.frequencies = {
             '50 kHz': 50000,
             '75 kHz': 75000, 
@@ -54,7 +53,8 @@ class SASModel:
     
     def mie_series_approximation(self, ka, density_contrast, compressibility_contrast):
         """
-        Proper Mie series for acoustic scattering from a fluid sphere
+        Mie series approximation for acoustic scattering from a fluid sphere
+            https://en.wikipedia.org/wiki/Mie_scattering
         
         Args:
             ka: Size parameter (k * radius)
@@ -93,10 +93,41 @@ class SASModel:
         
         return max(sigma_bs, 1e-10)
     
+    def rayleigh_scattering(self, ka, density_contrast, compressibility_contrast):
+        """
+        Rayleigh scattering approximation for small particles (ka < 0.5)
+        
+        Args:
+            ka: Size parameter (k * radius)
+            density_contrast: Target/water density ratio
+            compressibility_contrast: Target/water compressibility ratio
+        
+        Returns:
+            Backscattering cross-section normalized by πa² (dimensionless)
+        """
+        g = density_contrast
+        h = compressibility_contrast
+        
+        scattering_factor = (g - 1) + 3 * (h - 1)
+        denominator = 2 * g + 1
+        
+        sigma_bs = (ka**4 / 9) * (scattering_factor / denominator)**2
+        
+        return max(sigma_bs, 1e-10)
+    
+    def geometric_approximation(self):
+        """
+        Geometric approximation for large particles (ka > 15)
+        
+        Returns:
+            Backscattering cross-section normalized by πa² (dimensionless)
+        """
+        return 1.0
+    
     def calculate_target_strength(self, frequency, target_diameter, 
                                 density_contrast=1.5, compressibility_contrast=0.8):
         """
-        Calculate target strength using Mie scattering physics
+        Calculate target strength using appropriate scattering regime
         
         Args:
             frequency: Acoustic frequency (Hz)
@@ -111,7 +142,12 @@ class SASModel:
         a = target_diameter / 2
         ka = k * a
         
-        sigma_bs_normalized = self.mie_series_approximation(ka, density_contrast, compressibility_contrast)
+        if ka < 0.5:
+            sigma_bs_normalized = self.rayleigh_scattering(ka, density_contrast, compressibility_contrast)
+        elif ka > 15:
+            sigma_bs_normalized = self.geometric_approximation()
+        else:
+            sigma_bs_normalized = self.mie_series_approximation(ka, density_contrast, compressibility_contrast)
         
         sigma_bs_m2 = sigma_bs_normalized * np.pi * a**2
         
@@ -136,11 +172,8 @@ class SASModel:
         round_trip_time = (2 * range_m) / self.sound_speed
         geometric_aperture = vehicle_speed * round_trip_time
         
-        # More realistic coherence constraint
         # Motion error affects RELATIVE positioning between pings, not absolute position
         # High-grade INS maintains relative accuracy much better than absolute accuracy
-        
-        # Relative motion error between adjacent pings is much smaller than cumulative error
         ping_rate = 10  # Hz (typical SAS ping rate)
         ping_interval = 1.0 / ping_rate  # seconds
         relative_motion_error = (motion_error_percent / 100) * vehicle_speed * ping_interval
@@ -165,21 +198,12 @@ class SASModel:
         # Use the less restrictive of the two approaches
         coherence_limit = max(coherence_limit, traditional_coherence)
         
-        # More restrictive practical limits for commercial systems:
-        # - INS drift accumulation
-        # - Water current variations  
-        # - Platform flex and vibrations
-        # - Computational processing limits
-        
         # Frequency-dependent stability limits (higher freq = shorter coherent aperture)
         freq_stability_factor = max(0.3, 100000 / frequency)  # Shorter apertures at higher freq
         practical_limit = min(geometric_aperture, 30 * freq_stability_factor)  # Even shorter practical limit
         
-        # INS quality limit - even high-grade systems degrade over time
-        ins_limit = min(geometric_aperture, 100)  # 100m maximum for high-grade INS
-        
         # Effective aperture is minimum of all constraints
-        effective_aperture = min(geometric_aperture, coherence_limit, practical_limit, ins_limit)
+        effective_aperture = min(geometric_aperture, coherence_limit, practical_limit)
         
         return max(self.physical_aperture, effective_aperture)
     
@@ -209,12 +233,6 @@ class SASModel:
         
         total_gain = along_track_gain + coherent_integration_gain + sidelobe_suppression
         
-        # REALISTIC processing gain limits for commercial SAS
-        # Real systems are limited by:
-        # - Imperfect motion compensation
-        # - Multipath interference  
-        # - Platform vibrations
-        # - Processing limitations
         freq_penalty = max(0, 2 * np.log10(frequency / 50000))  # Penalty above 50kHz
         
         # Processing gain limits for practical systems
@@ -254,6 +272,7 @@ class SASModel:
     def calculate_seawater_absorption(self, frequency_hz):
         """
         Francois & Garrison model with environmental parameters
+        http://resource.npl.co.uk/acoustics/techguides/seaabsorption/
         
         Args:
             frequency_hz: Frequency in Hz
@@ -287,6 +306,7 @@ class SASModel:
     def wenz_noise_model(self, frequency):
         """
         Ambient noise model based on Wenz curves
+        https://studylib.net/doc/11095773/ambient-noise-the-background-noise-of-the-sea.
         
         Args:
             frequency: Acoustic frequency (Hz)
