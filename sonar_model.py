@@ -13,6 +13,8 @@ warnings.filterwarnings('ignore')
 
 import tqdm
 
+colormap = 'gist_earth'
+
 class SASModel:
     """Synthetic Aperture Sonar detection range model"""
     
@@ -54,7 +56,7 @@ class SASModel:
     def mie_series_approximation(self, ka, density_contrast, compressibility_contrast):
         """
         Mie series approximation for acoustic scattering from a fluid sphere
-            https://en.wikipedia.org/wiki/Mie_scattering
+        Based on Anderson (1950) and Faran (1951)
         
         Args:
             ka: Size parameter (k * radius)
@@ -81,6 +83,7 @@ class SASModel:
             jn_kai = spherical_jn(n, ka_internal)
             jn_prime_kai = spherical_jn(n, ka_internal, derivative=True)
             
+            # Acoustic scattering coefficients with boundary conditions
             numerator = (g * jn_prime_kai * jn_ka - jn_kai * jn_prime_ka)
             denominator = (g * jn_prime_kai * (jn_ka + 1j * yn_ka) - 
                           jn_kai * (jn_prime_ka + 1j * yn_prime_ka))
@@ -96,6 +99,7 @@ class SASModel:
     def rayleigh_scattering(self, ka, density_contrast, compressibility_contrast):
         """
         Rayleigh scattering approximation for small particles (ka < 0.5)
+        Using Anderson (1950) formulation for acoustic scattering
         
         Args:
             ka: Size parameter (k * radius)
@@ -108,10 +112,14 @@ class SASModel:
         g = density_contrast
         h = compressibility_contrast
         
-        scattering_factor = (g - 1) + 3 * (h - 1)
-        denominator = 2 * g + 1
+        # Rayleigh formula for acoustic scattering
+        # σ_bs/πa² = (ka)⁴/9 × [f₁ - f₂]²
+        # where f₁ = (g-1)/(2g+1) and f₂ = (h-1)/(1+2(h-1)/3)
         
-        sigma_bs = (ka**4 / 9) * (scattering_factor / denominator)**2
+        f1 = (g - 1) / (2 * g + 1)
+        f2 = (h - 1) / (1 + 2 * (h - 1) / 3)
+        
+        sigma_bs = (ka**4 / 9) * (f1 - f2)**2
         
         return max(sigma_bs, 1e-10)
     
@@ -157,12 +165,12 @@ class SASModel:
     
     def calculate_effective_aperture(self, range_m, vehicle_speed, motion_error_percent, frequency=100000):
         """
-        Calculate SAS effective aperture with proper coherence constraints
+        Calculate SAS effective aperture with cumulative coherence constraints
         
         Args:
             range_m: Range to target (m)
             vehicle_speed: Vehicle speed (m/s)
-            motion_error_percent: Motion error as % of vehicle speed
+            motion_error_percent: Motion error as % of vehicle speed (RMS per second)
             frequency: Operating frequency (Hz) for wavelength-dependent coherence
         
         Returns:
@@ -172,35 +180,33 @@ class SASModel:
         round_trip_time = (2 * range_m) / self.sound_speed
         geometric_aperture = vehicle_speed * round_trip_time
         
-        # Motion error affects RELATIVE positioning between pings, not absolute position
-        # High-grade INS maintains relative accuracy much better than absolute accuracy
-        ping_rate = 10  # Hz (typical SAS ping rate)
-        ping_interval = 1.0 / ping_rate  # seconds
-        relative_motion_error = (motion_error_percent / 100) * vehicle_speed * ping_interval
-        
-        # Use frequency-dependent coherence criterion
-        # Each frequency uses its own wavelength for proper coherence calculation
+        # Motion error accumulation over aperture synthesis
+        # Motion errors accumulate as random walk over synthetic aperture
         wavelength = self.sound_speed / frequency
         phase_tolerance = wavelength / 8  # Standard λ/8 coherence criterion
         
-        # Maximum aperture length before phase decorrelation
-        if relative_motion_error > 0:
-            # Coherence length based on relative ping-to-ping errors, not cumulative
-            coherence_limit = phase_tolerance / relative_motion_error * ping_interval * vehicle_speed
-            # This gives the maximum aperture where phase errors accumulate to λ/4
+        # RMS motion error per second
+        motion_error_per_sec = (motion_error_percent / 100) * vehicle_speed
+        
+        # For aperture of length L, synthesis time is T = L / v
+        # Cumulative RMS error: σ_cumulative = σ_per_sec × sqrt(T)
+        # Phase error must satisfy: 2π × σ_cumulative / λ < π/4 (λ/8 criterion)
+        # This gives: σ_per_sec × sqrt(L/v) < λ/8
+        # Solving for L: L < (λ/8 / σ_per_sec)² × v
+        
+        if motion_error_per_sec > 0:
+            coherence_limit = (phase_tolerance / motion_error_per_sec)**2 * vehicle_speed
         else:
-            coherence_limit = 1000  # Very large if no motion error
+            coherence_limit = 10000  # Very large if no motion error
         
-        # Alternative coherence limit based on traditional approach but with looser criterion
-        traditional_motion_error = (motion_error_percent / 100) * vehicle_speed
-        traditional_coherence = phase_tolerance / traditional_motion_error  # λ/4 instead of λ/8
-        
-        # Use the less restrictive of the two approaches
-        coherence_limit = max(coherence_limit, traditional_coherence)
-        
-        # Frequency-dependent stability limits (higher freq = shorter coherent aperture)
-        freq_stability_factor = max(0.3, 100000 / frequency)  # Shorter apertures at higher freq
-        practical_limit = min(geometric_aperture, 30 * freq_stability_factor)  # Even shorter practical limit
+        # Practical limits from system stability
+        # Higher frequencies have reduced coherence due to:
+        # - Increased sensitivity to platform motion
+        # - Shorter wavelengths make phase errors more critical
+        # - Environmental effects (water turbulence, multipath)
+        max_practical_aperture = 50.0  # meters for stable platforms
+        freq_degradation = np.exp(-(frequency - 50000) / 100000)  # Exponential decay
+        practical_limit = max_practical_aperture * (0.3 + 0.7 * freq_degradation)
         
         # Effective aperture is minimum of all constraints
         effective_aperture = min(geometric_aperture, coherence_limit, practical_limit)
@@ -220,24 +226,27 @@ class SASModel:
         """
         wavelength = self.sound_speed / frequency
         
-        # Along-track beamforming gain (this is the main SAS advantage)
+        # Along-track beamforming gain (main SAS advantage)
+        # This represents coherent integration over synthetic aperture
         along_track_gain = 10 * np.log10(effective_aperture / self.physical_aperture)
         
-        # Multi-look processing gain (coherent integration)
-        # Number of independent looks based on aperture sampling
-        n_looks = max(1, int(effective_aperture / (wavelength/2)))  # Nyquist sampling
-        coherent_integration_gain = 10 * np.log10(min(n_looks, 50))  # More conservative cap
+        # Additional incoherent processing gain from multi-look averaging
+        # This is ONLY applicable if doing separate incoherent averaging after SAR processing
+        # For N independent looks: gain = 10*log10(sqrt(N)) = 5*log10(N)
+        # Typical SAS systems use 4-8 independent looks
+        n_independent_looks = 4  # Conservative estimate
+        multilook_gain = 5 * np.log10(n_independent_looks)  # sqrt(N) improvement
         
-        # SAS sidelobe suppression benefit
-        sidelobe_suppression = 2  # dB (more conservative)
+        # Sidelobe suppression from windowing
+        sidelobe_suppression = 1.5  # dB (conservative)
         
-        total_gain = along_track_gain + coherent_integration_gain + sidelobe_suppression
+        # Total processing gain
+        total_gain = along_track_gain + multilook_gain + sidelobe_suppression
         
-        freq_penalty = max(0, 2 * np.log10(frequency / 50000))  # Penalty above 50kHz
-        
-        # Processing gain limits for practical systems
-        # Commercial SAS systems achieve 8-12dB typical, 15dB maximum under ideal conditions
-        return min(total_gain - freq_penalty, 12)  # 12dB maximum gain
+        # Practical systems achieve 10-15 dB typical processing gain
+        if total_gain > 15:
+            print(f"Warning: Processing gain is higher than realistic: {total_gain} dB > 15 dB")
+        return min(total_gain, 15)  # 15 dB maximum realistic gain
     
     def calculate_cavitation_limit(self, frequency, depth=50):
         """
@@ -251,18 +260,16 @@ class SASModel:
             Maximum source level before cavitation (dB re 1 μPa at 1m)
         """
         # Base cavitation threshold (at 10 kHz, sea level)
-        # Higher frequencies have HIGHER cavitation thresholds
         base_freq = 10000  # Hz
         base_threshold = 220  # dB re 1 μPa
         
         # Frequency dependence: threshold increases with frequency
-        # Higher frequencies create lower pressure amplitudes for same intensity
-        frequency_correction = 3 * np.log10(frequency / base_freq)  # +3dB per decade
+        frequency_correction = 2.5 * np.log10(frequency / base_freq)  # 2.5 dB per decade
         
-        # Depth correction: +6 dB per atmosphere
+        # Depth correction: +6 dB per atmosphere (~10m depth)
         depth_correction = 6 * np.log10((depth + 10) / 10)
         
-        # Conservative operating limit (allow some micro-bubbles)
+        # Conservative operating margin
         operating_margin = 5  # dB below inception threshold
         
         max_sl = base_threshold + frequency_correction + depth_correction - operating_margin
@@ -271,7 +278,7 @@ class SASModel:
     
     def calculate_seawater_absorption(self, frequency_hz):
         """
-        Francois & Garrison model with environmental parameters
+        Francois & Garrison model with environmental parameters including pH
         http://resource.npl.co.uk/acoustics/techguides/seaabsorption/
         
         Args:
@@ -283,30 +290,36 @@ class SASModel:
         f_khz = frequency_hz / 1000
         T = self.water_temperature  # °C
         S = self.salinity  # ppt
+        pH = self.ph
         
-        # Temperature and salinity corrections
-        temp_factor = 1 + 0.0383 * (T - 20)
-        salinity_factor = 1 + 0.0268 * (S - 35) / 35
+        # Boric acid relaxation frequency (with pH dependence)
+        A1 = 8.86 / self.sound_speed * 10**(0.78 * pH - 5)
+        P1 = 1  # Pressure in atmospheres (shallow water)
+        f1 = 2.8 * np.sqrt(S / 35) * 10**(4 - 1245 / (T + 273))
         
-        # Boric acid relaxation
-        f1 = 0.78 * np.sqrt(S/35) * np.exp(T/26)
-        absorption1 = (0.106 * f1 * f_khz**2) / (f1**2 + f_khz**2)
+        # Boric acid absorption
+        absorption1 = (A1 * P1 * f1 * f_khz**2) / (f1**2 + f_khz**2)
         
         # Magnesium sulfate relaxation
-        f2 = 42 * np.exp(T/17)
-        absorption2 = (0.52 * (S/35) * f2 * f_khz**2) / (f2**2 + f_khz**2)
+        A2 = 21.44 * S / self.sound_speed * (1 + 0.025 * T)
+        P2 = 1 - 1.37e-4 * 50 + 6.2e-9 * 50**2  # Depth = 50m
+        f2 = 8.17 * 10**(8 - 1990 / (T + 273)) / (1 + 0.0018 * (S - 35))
+        
+        # Magnesium sulfate absorption
+        absorption2 = (A2 * P2 * f2 * f_khz**2) / (f2**2 + f_khz**2)
         
         # Pure water absorption
-        absorption3 = 0.00049 * f_khz**2 * np.exp(-(T-27)/17)
+        A3 = 4.937e-4 - 2.59e-5 * T + 9.11e-7 * T**2 - 1.5e-8 * T**3
+        absorption3 = A3 * P2 * f_khz**2
         
-        total_absorption = (absorption1 + absorption2 + absorption3) * temp_factor * salinity_factor
+        total_absorption = absorption1 + absorption2 + absorption3
         
         return total_absorption
     
     def wenz_noise_model(self, frequency):
         """
         Ambient noise model based on Wenz curves
-        https://studylib.net/doc/11095773/ambient-noise-the-background-noise-of-the-sea.
+        https://studylib.net/doc/11095773/ambient-noise-the-background-noise-of-the-sea
         
         Args:
             frequency: Acoustic frequency (Hz)
@@ -316,22 +329,21 @@ class SASModel:
         """
         f_khz = frequency / 1000
         
-        # Wenz noise components
+        # Wenz noise components (all in dB re 1 μPa²/Hz)
         # Thermal noise (dominant at high frequencies)
         thermal_noise = -15 + 20 * np.log10(f_khz)
         
         # Sea state noise (dominant at mid frequencies)
-        # Sea state 3: moderate seas, 3-4 foot waves
         sea_noise = 50 + 7.5 * self.sea_state - 20 * np.log10(f_khz)
         
         # Shipping noise (dominant at low frequencies)
         shipping_noise = 76 - 20 * np.log10(f_khz)
         
         # Wind noise
-        wind_speed = 5 + 2.5 * self.sea_state  # Approximate wind from sea state
+        wind_speed = 5 + 2.5 * self.sea_state
         wind_noise = 44 + 0.5 * wind_speed - 15 * np.log10(f_khz)
         
-        # Combine noise sources (energy addition)
+        # Combine noise sources (power addition in linear domain)
         combined_noise = 10 * np.log10(
             10**(thermal_noise/10) + 
             10**(sea_noise/10) + 
@@ -339,7 +351,6 @@ class SASModel:
             10**(wind_noise/10)
         )
         
-        # Convert to 1 Hz bandwidth
         return combined_noise
     
     def calculate_noise_level(self, frequency, bandwidth=None):
@@ -375,21 +386,22 @@ class SASModel:
         """
         wavelength = self.sound_speed / frequency
         
-        # Beamwidth in radians (along-track and across-track)
+        # Beamwidth in radians
         along_track_beamwidth = wavelength / effective_aperture
         across_track_beamwidth = wavelength / self.physical_aperture
         
         # Range resolution from bandwidth
         range_resolution = self.sound_speed / (2 * self.bandwidth)
         
-        # Ensonified volume (cone approximation)
+        # Ensonified volume
         volume = (np.pi * range_m**2 * along_track_beamwidth * across_track_beamwidth * 
                  range_resolution / 4)
         
-        # Volume backscattering coefficient (frequency dependent)
-        # Typical values: -80 to -90 dB for clean ocean water
-        # Increases with frequency and particulate matter
-        sigma_v_db = -85 + 1.5 * np.log10(frequency / 100000)
+        # Volume backscattering coefficient (frequency and depth dependent)
+        # Base value for clean ocean water at 100 kHz
+        sigma_v_base_db = -85
+        freq_dependence = 1.5 * np.log10(frequency / 100000)  # Rayleigh scattering
+        sigma_v_db = sigma_v_base_db + freq_dependence
         sigma_v = 10**(sigma_v_db / 10)
         
         # Volume reverberation level
@@ -422,10 +434,13 @@ class SASModel:
         # Resolution cell area on seafloor
         clutter_area = range_resolution * along_track_resolution / np.sin(grazing_angle_rad)
         
-        # Seafloor backscattering coefficient (Lambert's law approximation)
-        # Typical values: -30 to -10 dB depending on seafloor type
-        # Sand: -25 dB, Mud: -35 dB, Rock: -15 dB
-        sigma_0_db = -25 + 10 * np.log10(np.sin(grazing_angle_rad)**2)
+        # Seafloor backscattering coefficient with frequency dependence
+        # Base value for sand at 30° grazing angle
+        sigma_0_base = -25  # dB
+        angle_dependence = 10 * np.log10(np.sin(grazing_angle_rad)**2)
+        # Roughness scattering increases with frequency
+        freq_dependence = 2 * np.log10(frequency / 100000)
+        sigma_0_db = sigma_0_base + angle_dependence + freq_dependence
         sigma_0 = 10**(sigma_0_db / 10)
         
         # Clutter level
@@ -435,7 +450,7 @@ class SASModel:
     
     def calculate_directivity_index(self, frequency, effective_aperture, aperture_width=None):
         """
-        Calculate proper directivity index for SAS array
+        Calculate directivity index for SAS array
         
         Args:
             frequency: Acoustic frequency (Hz)
@@ -450,19 +465,13 @@ class SASModel:
         if aperture_width is None:
             aperture_width = self.physical_aperture
         
-        # Along-track directivity (from synthetic aperture)
-        # DI = 10*log10(4π*A/λ²) for a uniformly illuminated aperture
-        along_track_di = 10 * np.log10(2 * effective_aperture / wavelength)
-        
-        # Across-track directivity (from physical aperture)
-        across_track_di = 10 * np.log10(2 * aperture_width / wavelength)
-        
-        # Total directivity (sum in dB space for orthogonal dimensions)
-        total_di = along_track_di + across_track_di
+        # Directivity for rectangular aperture: DI = 10*log10(4π*A/λ²)
+        # where A = L × W (aperture area)
+        aperture_area = effective_aperture * aperture_width
+        total_di = 10 * np.log10(4 * np.pi * aperture_area / wavelength**2)
         
         # Apply realistic array efficiency factor
-        # Real arrays have tapering, element spacing, and other non-idealities
-        array_efficiency = 0.7
+        array_efficiency = 0.7  # Accounts for tapering, element spacing, etc.
         total_di = total_di + 10 * np.log10(array_efficiency)
         
         return max(total_di, 0)
@@ -475,42 +484,45 @@ class SASModel:
         Args:
             frequency: Acoustic frequency (Hz)
             vehicle_speed: Vehicle speed (m/s)
-            motion_error_percent: Motion error as % of vehicle speed
+            motion_error_percent: Motion error as % of vehicle speed (RMS per second)
             effective_aperture: Effective synthetic aperture (m)
         
         Returns:
             Motion degradation (dB)
         """
-        # Motion degradation model for commercial systems
-        # Real SAS systems suffer significant degradation from:
-        # - Imperfect INS measurements
-        # - Platform vibrations
-        # - Water current effects
-        # - Multipath propagation
-        
-        motion_error_m = (motion_error_percent / 100) * vehicle_speed
+        motion_error_per_sec = (motion_error_percent / 100) * vehicle_speed
         wavelength = self.sound_speed / frequency
         
-        # Phase error from motion uncertainty
-        phase_error = (2 * np.pi * motion_error_m) / wavelength
+        # Aperture synthesis time
+        synthesis_time = effective_aperture / vehicle_speed
         
-        # Real systems have significant residual errors even after compensation
-        # Commercial INS + DVL typically leaves 20-30% residual error
-        residual_factor = 0.25  # 25% residual error after compensation
-        effective_phase_error = phase_error * residual_factor
+        # Cumulative RMS phase error over aperture (random walk)
+        cumulative_motion_error = motion_error_per_sec * np.sqrt(synthesis_time)
+        phase_error_rms = (2 * np.pi * cumulative_motion_error) / wavelength
         
-        # Coherence loss from phase errors
+        # Residual error after motion compensation (INS + autofocus)
+        # High-grade tactical INS: 5-10% residual
+        # Medium-grade navigation INS: 15-25% residual
+        residual_factor = 0.15  # 15% residual after compensation
+        effective_phase_error = phase_error_rms * residual_factor
+        
+        # Coherence loss from Gaussian phase errors
         coherence = np.exp(-(effective_phase_error**2) / 2)
         coherence_loss = -10 * np.log10(max(coherence, 0.01))
         
         # Additional degradation sources
-        multipath_loss = 2.0  # dB (seafloor multipath)
-        platform_vibration_loss = 1.5  # dB (engine/propeller vibrations)
-        aperture_decorrelation = min(3.0, 0.3 * np.log10(effective_aperture / self.physical_aperture))
+        multipath_loss = 1.5  # dB (seafloor/surface multipath)
+        platform_vibration_loss = 1.0  # dB (engine/propeller vibrations)
         
-        total_degradation = coherence_loss + multipath_loss + platform_vibration_loss + aperture_decorrelation
+        # Aperture decorrelation (longer apertures harder to maintain coherence)
+        aperture_factor = min(2.0, 0.2 * np.log10(effective_aperture / self.physical_aperture))
         
-        return min(total_degradation, 15)  # Much higher realistic degradation
+        total_degradation = coherence_loss + multipath_loss + platform_vibration_loss + aperture_factor
+        
+        if total_degradation > 12:
+            print(f"Warning: Motion degradation is higher than realistic: {total_degradation} dB > 12 dB")
+
+        return min(total_degradation, 12)  # Realistic maximum degradation
     
     def calculate_energy_constraint(self, sonar_power, vehicle_speed):
         """
@@ -522,13 +534,14 @@ class SASModel:
         total_power = sonar_power + propulsion_power + self.hotel_load
         
         if total_power > self.max_power_budget:
-            return -(total_power - self.max_power_budget) / 50  # Gradual penalty
+            return -(total_power - self.max_power_budget) / 50
         return 0
     
     def calculate_sas_range(self, electrical_power, frequency, vehicle_speed, 
                            motion_error_percent, target_size):
         """
         Calculate maximum SAS detection range using sonar equation
+        Uses bisection method for robust convergence
         
         Args:
             electrical_power: Average electrical power (W)
@@ -540,93 +553,84 @@ class SASModel:
         Returns:
             Maximum detection range (m)
         """
-        # Iterative solution since effective aperture depends on range
-        range_m = 100  # Initial guess
-        converged = False
+        # Bisection search for range where signal excess = 0
+        range_min = 10.0
+        range_max = 8000.0
+        tolerance = 5.0  # meters
         
-        for iteration in range(15):  # More iterations for stability
-            if converged:
-                break
-                
-            old_range = range_m
+        def calculate_signal_excess(range_m):
+            """Calculate signal excess at given range"""
+            # Range-dependent parameters
+            effective_aperture = self.calculate_effective_aperture(
+                range_m, vehicle_speed, motion_error_percent, frequency
+            )
             
-            # Calculate range-dependent parameters
-            effective_aperture = self.calculate_effective_aperture(range_m, vehicle_speed, 
-                                                                 motion_error_percent, frequency)
-            
-            # Source level calculation
+            # Source level
             wavelength = self.sound_speed / frequency
             transmit_di = 10 * np.log10(4 * np.pi * effective_aperture**2 / wavelength**2)
-            
             theoretical_sl = (170.8 + 10 * np.log10(self.transducer_efficiency * electrical_power) 
                             + transmit_di)
             cavitation_limit = self.calculate_cavitation_limit(frequency, 50)
             source_level = min(theoretical_sl, cavitation_limit)
             
-            # Target strength with proper physics
+            # Target strength
             target_strength = self.calculate_target_strength(frequency, target_size)
             
-            # Two-way transmission loss
+            # Transmission loss (spherical spreading + absorption)
             absorption_coeff = self.calculate_seawater_absorption(frequency)
             transmission_loss = 40 * np.log10(range_m) + 2 * absorption_coeff * range_m / 1000
             
-            # Improved directivity index
+            # Receive directivity
             receive_di = self.calculate_directivity_index(frequency, effective_aperture)
             
-            # Improved noise model with bandwidth
+            # Noise and reverberation
             ambient_noise = self.calculate_noise_level(frequency, self.bandwidth)
+            volume_reverberation = self.calculate_volume_reverberation(
+                frequency, range_m, effective_aperture
+            )
+            seafloor_clutter = self.calculate_seafloor_clutter(
+                frequency, range_m, effective_aperture, grazing_angle_deg=30
+            )
             
-            # Additional noise sources
-            volume_reverberation = self.calculate_volume_reverberation(frequency, range_m, 
-                                                                      effective_aperture)
-            seafloor_clutter = self.calculate_seafloor_clutter(frequency, range_m, 
-                                                               effective_aperture, 
-                                                               grazing_angle_deg=30)
-            
-            # Combined noise level (energy addition)
+            # Combined noise (power addition)
             total_noise = 10 * np.log10(
                 10**(ambient_noise/10) + 
                 10**(volume_reverberation/10) + 
                 10**(seafloor_clutter/10)
             )
             
-            # SAS processing gain
             processing_gain = self.calculate_sas_processing_gain(effective_aperture, frequency)
+
+            motion_degradation = self.calculate_motion_degradation(
+                frequency, vehicle_speed, motion_error_percent, effective_aperture
+            )
             
-            # Motion degradation
-            motion_degradation = self.calculate_motion_degradation(frequency, vehicle_speed, 
-                                                                 motion_error_percent, 
-                                                                 effective_aperture)
-            
-            # Energy constraint
             energy_penalty = self.calculate_energy_constraint(electrical_power, vehicle_speed)
             
-            # Improved sonar equation
+            # Sonar equation
             signal_excess = (source_level + target_strength - transmission_loss + 
                            receive_di - total_noise + processing_gain - 
                            self.detection_threshold - motion_degradation + energy_penalty)
             
-            # More stable range adjustment to prevent oscillation
-            if signal_excess <= -3:  # Clearly insufficient signal
-                range_m = max(10, range_m * 0.85)
-            elif signal_excess >= 3:  # Clearly sufficient signal  
-                scaling_factor = min(1.15, 10**(signal_excess / 80))  # Less aggressive scaling
-                range_m = min(range_m * scaling_factor, 5000)
-            else:
-                # Near threshold: use small adjustments to prevent oscillation
-                if signal_excess < 0:
-                    range_m = max(10, range_m * 0.98)  # Small reduction
-                else:
-                    range_m = min(range_m * 1.02, 5000)  # Small increase
-            
-            # More stringent convergence check near threshold
-            convergence_tolerance = 0.02 if abs(signal_excess) > 3 else 0.005
-            if abs(range_m - old_range) / max(old_range, 1) < convergence_tolerance:
-                converged = True
-
-            # final_effective_aperture = self.calculate_effective_aperture(range_m, vehicle_speed, motion_error_percent, frequency)
+            return signal_excess
         
-        return min(range_m, 8000)  # Practical maximum range
+        # Bisection search
+        for iteration in range(30):
+            range_mid = (range_min + range_max) / 2
+            
+            if range_max - range_min < tolerance:
+                break
+            
+            signal_excess_mid = calculate_signal_excess(range_mid)
+            
+            if signal_excess_mid > 0:
+                # Can detect farther
+                range_min = range_mid
+            else:
+                # Too far, reduce range
+                range_max = range_mid
+        
+        return min((range_min + range_max) / 2, 8000)
 
 def _calculate_range_worker(args):
     """Worker function for multiprocessing pool"""
@@ -641,20 +645,16 @@ def create_interactive_plot():
     
     model = SASModel()
     
-    # Create figure and axis
     fig, ax = plt.subplots(figsize=(12, 8))
     plt.subplots_adjust(bottom=0.35)
     
-    # Initial parameters
-    initial_vehicle_speed = 2.0  # m/s
-    initial_motion_error = 0.1   # % of vehicle speed
-    initial_target_size = 0.1    # m diameter
+    initial_vehicle_speed = 2.0 # m/s
+    initial_motion_error = 0.1 # % of speed RMS
+    initial_target_size = 0.1 # m
     initial_log_scale = False
     
-    # Power range: 1W to 100W
     powers = np.linspace(1, 100, 50)
     
-    # Create sliders
     ax_speed = plt.axes([0.15, 0.25, 0.65, 0.03])
     ax_motion = plt.axes([0.15, 0.20, 0.65, 0.03]) 
     ax_target = plt.axes([0.15, 0.15, 0.65, 0.03])
@@ -669,16 +669,13 @@ def create_interactive_plot():
     slider_log = Slider(ax_log, 'Log Scale', 0, 1, valinit=0, valfmt='%d')
     
     def update_plot(val=None):
-        """Update plot based on slider values"""
         ax.clear()
         
-        # Get current slider values
         vehicle_speed = slider_speed.val
         motion_error = slider_motion.val  
         target_size = slider_target.val
         log_scale = slider_log.val > 0.5
         
-        # Calculate ranges for each frequency
         for i, (freq_name, frequency) in enumerate(model.frequencies.items()):
             ranges = []
             for power in powers:
@@ -688,7 +685,6 @@ def create_interactive_plot():
             
             ax.plot(powers, ranges, label=freq_name, color=model.colors[i], linewidth=2)
         
-        # Set scale and labels
         if log_scale:
             ax.set_yscale('log')
             ax.set_ylim(10, 10000)
@@ -703,13 +699,12 @@ def create_interactive_plot():
         ax.grid(True, alpha=0.3)
         ax.legend()
         
-        # Add scattering regime analysis
         k_100khz = 2 * np.pi * 100000 / model.sound_speed
         ka_100khz = k_100khz * (target_size/2)
         
-        if ka_100khz < 0.3:
+        if ka_100khz < 0.5:
             regime = "Rayleigh (TS ∝ f⁴)"
-        elif ka_100khz > 10:
+        elif ka_100khz > 15:
             regime = "Geometric (frequency independent)"
         else:
             regime = "Mie/Resonance (complex)"
@@ -718,13 +713,11 @@ def create_interactive_plot():
                 transform=ax.transAxes, fontsize=10, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.6))
     
-    # Connect sliders to update function
     slider_speed.on_changed(update_plot)
     slider_motion.on_changed(update_plot)
     slider_target.on_changed(update_plot)
     slider_log.on_changed(update_plot)
     
-    # Initial plot
     update_plot()
     
     plt.show()
@@ -734,23 +727,18 @@ def create_3d_surface_plot():
     
     model = SASModel()
     
-    # Fixed parameters for 3D plot
-    fixed_electrical_power = 50.0  # W
-    fixed_vehicle_speed = 2.0      # m/s  
-    fixed_motion_error = 0.1       # % of vehicle speed
+    fixed_electrical_power = 50.0
+    fixed_vehicle_speed = 2.0
+    fixed_motion_error = 0.1
     
-    # Define parameter ranges
     target_diameters = np.logspace(-3, 0, 100)
     frequencies = np.linspace(10000, 200000, 100)
     
-    # Create meshgrid
     TARGET_MESH, FREQ_MESH = np.meshgrid(target_diameters, frequencies)
     
-    # Calculate detection range for each combination using multiprocessing
     print(f"Calculating detection ranges for 3D surface using {cpu_count()} cores...")
     RANGE_MESH = np.zeros_like(TARGET_MESH)
     
-    # Prepare arguments for all calculations
     args_list = []
     for i in range(TARGET_MESH.shape[0]):
         for j in range(TARGET_MESH.shape[1]):
@@ -759,55 +747,43 @@ def create_3d_surface_plot():
             args_list.append((target_size, frequency, fixed_electrical_power, 
                             fixed_vehicle_speed, fixed_motion_error))
     
-    # Calculate in parallel
     with Pool() as pool:
         results = pool.map(_calculate_range_worker, args_list)
     
-    # Reshape results back into mesh
     RANGE_MESH = np.array(results).reshape(TARGET_MESH.shape)
     print("100% complete")
     
-    # Create 3D surface plot
     fig = plt.figure(figsize=(15, 10))
     ax = fig.add_subplot(111, projection='3d')
     
-    # Normalize data for better 3D visualization
-    # Use log scale for target sizes to handle the wide range
     LOG_TARGET_MESH = np.log10(TARGET_MESH)
     NORM_FREQ_MESH = (FREQ_MESH - frequencies.min()) / (frequencies.max() - frequencies.min())
     NORM_RANGE_MESH = (RANGE_MESH - RANGE_MESH.min()) / (RANGE_MESH.max() - RANGE_MESH.min())
     
-    # Create surface plot with normalized coordinates
     surf = ax.plot_surface(LOG_TARGET_MESH, NORM_FREQ_MESH, NORM_RANGE_MESH, 
-                          cmap='viridis', alpha=0.8, linewidth=0, antialiased=True,
+                          cmap=colormap, alpha=0.8, linewidth=0, antialiased=True,
                           rstride=1, cstride=1)
     
-    # Add contour lines on the normalized surface
     contours = ax.contour(LOG_TARGET_MESH, NORM_FREQ_MESH, NORM_RANGE_MESH, 
                          levels=8, colors='black', alpha=0.4, linewidths=0.8)
     
-    # Set up custom tick labels to show actual values
-    # X-axis (target diameter) - log scale
     log_target_ticks = np.log10([0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
     target_tick_labels = ['0.01', '0.02', '0.05', '0.1', '0.2', '0.5', '1.0']
     ax.set_xticks(log_target_ticks)
     ax.set_xticklabels(target_tick_labels)
     
-    # Y-axis (frequency) - normalized scale
     freq_ticks = np.linspace(0, 1, 6)
     freq_values = frequencies.min() + freq_ticks * (frequencies.max() - frequencies.min())
     freq_labels = [f'{int(f/1000)}' for f in freq_values]
     ax.set_yticks(freq_ticks)
     ax.set_yticklabels(freq_labels)
     
-    # Z-axis (range) - normalized scale  
     range_ticks = np.linspace(0, 1, 6)
     range_values = RANGE_MESH.min() + range_ticks * (RANGE_MESH.max() - RANGE_MESH.min())
     range_labels = [f'{int(r)}' for r in range_values]
     ax.set_zticks(range_ticks)
     ax.set_zticklabels(range_labels)
     
-    # Set labels and title
     ax.set_xlabel('Target Diameter (m)', fontsize=12, labelpad=10)
     ax.set_ylabel('Frequency (kHz)', fontsize=12, labelpad=10)
     ax.set_zlabel('Detection Range (m)', fontsize=12, labelpad=10)
@@ -816,22 +792,15 @@ def create_3d_surface_plot():
                 f'Power: {fixed_electrical_power}W, Speed: {fixed_vehicle_speed}m/s, '
                 f'Motion Error: {fixed_motion_error}%', fontsize=14, pad=20)
     
-    # Add colorbar mapped to actual range values
-    mappable = plt.cm.ScalarMappable(cmap='viridis')
+    mappable = plt.cm.ScalarMappable(cmap=colormap)
     mappable.set_array(RANGE_MESH)
     colorbar = fig.colorbar(mappable, ax=ax, shrink=0.6, aspect=20)
     colorbar.set_label('Detection Range (m)', fontsize=11)
     
-    # Set equal aspect ratio for better 3D interaction
-    ax.set_box_aspect([1,1,0.8])  # Make Z slightly shorter for better viewing
-    
-    # Improve viewing angle
+    ax.set_box_aspect([1,1,0.8])
     ax.view_init(elev=25, azim=45)
-    
-    # Add grid
     ax.grid(True, alpha=0.3)
     
-    # Add text box with scattering regime information
     textstr = '\n'.join([
         'Scattering Regimes:',
         '• Small targets (ka < 0.5): Rayleigh (TS ∝ f⁴)',  
@@ -851,23 +820,19 @@ def create_cmap_2d_plot():
     
     model = SASModel()
     
-    # Fixed parameters
     fixed_electrical_power = 50.0
     fixed_vehicle_speed = 1.0
     fixed_motion_error = 0.1
     
-    # Define parameter ranges (same as 3D plot for consistency)
-    target_diameters = np.logspace(-2.7, 1.3, 200)
-    frequencies = np.linspace(20000, 200000, 150)
+    target_diameters = np.logspace(-2.7, 1.3, 400)
+    frequencies = np.linspace(40000, 200000, 300)
     
-    # Create meshgrid
     TARGET_MESH, FREQ_MESH = np.meshgrid(target_diameters, frequencies)
     RANGE_MESH = np.zeros_like(TARGET_MESH)
     
     thread_count = cpu_count() // 2 
     print(f"Calculating detection ranges for 2D plot using {thread_count} cores...")
     
-    # Prepare arguments for all calculations
     args_list = []
     for i in range(TARGET_MESH.shape[0]):
         for j in range(TARGET_MESH.shape[1]):
@@ -876,19 +841,18 @@ def create_cmap_2d_plot():
             args_list.append((target_size, frequency, fixed_electrical_power,
                             fixed_vehicle_speed, fixed_motion_error))
     
-    # Calculate in parallel
     results = []
     with Pool(thread_count) as pool:
         for r in tqdm.tqdm(pool.imap(_calculate_range_worker, args_list), total=len(args_list)):
             results.append(r)
     
-    # Reshape results back into mesh
     RANGE_MESH = np.array(results).reshape(TARGET_MESH.shape)
     print("100% complete")
+    
     fig, ax = plt.subplots(figsize=(12, 8))
     
     im = ax.pcolormesh(TARGET_MESH, FREQ_MESH/1000, RANGE_MESH, 
-                       cmap='viridis', shading='gouraud')
+                       cmap=colormap, shading='gouraud')
     
     colorbar = fig.colorbar(im, ax=ax)
     colorbar.set_label('Detection Range (m)', fontsize=11)
@@ -901,22 +865,12 @@ def create_cmap_2d_plot():
                 f'Power: {fixed_electrical_power}W, Speed: {fixed_vehicle_speed}m/s, '
                 f'Motion Error: {fixed_motion_error}%', fontsize=14)
     
-    # Add grid
     ax.grid(True, alpha=0.3)
     
-    # Add scattering regime boundaries as curves
-    # For a given target diameter d and frequency f:
-    # ka = π*d*f/c
-    # So for constant ka: f = ka*c/(π*d)
-    
-    # Calculate boundary curves    
-    # ka = 0.5 boundary (Rayleigh to Mie/Resonance transition)
+    # Scattering regime boundaries
     ka_05_freq = (0.5 * model.sound_speed) / (np.pi * target_diameters)
-    
-    # ka = 15 boundary (Mie/Resonance to Geometric transition)
     ka_15_freq = (15 * model.sound_speed) / (np.pi * target_diameters)
     
-    # Plot the boundary curves
     mask_05 = (ka_05_freq >= frequencies.min()) & (ka_05_freq <= frequencies.max())
     if np.any(mask_05):
         ax.plot(target_diameters[mask_05], ka_05_freq[mask_05]/1000, 
@@ -928,9 +882,7 @@ def create_cmap_2d_plot():
                'orange', linestyle='--', linewidth=2.5, alpha=0.8, 
                label='ka = 15 (Mie→Geometric)')
     
-    # Add text labels for the three regimes
-    # Find good positions for labels within the plot, these are not automatically placed
-    ax.text(0.004, 30, 'Rayleigh\n(TS ∝ f⁴)', fontsize=11, 
+    ax.text(0.003, 45, 'Rayleigh\n(TS ∝ f⁴)', fontsize=11, 
            bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7),
            ha='center', va='center')
     
@@ -942,25 +894,19 @@ def create_cmap_2d_plot():
            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7),
            ha='center', va='center')
     
-    # Update legend
     ax.legend(loc='upper right', fontsize=9)
     
     plt.tight_layout()
     return fig, ax
 
 if __name__ == "__main__":
-    
-    # Create both 3D surface and 2D contour plots
     print("Creating 3D surface plot...")
-    # fig_3d, ax_3d = create_3d_surface_plot()
-    
-    print("\nCreating 2D colormap plot...")
+    fig_3d, ax_3d = create_3d_surface_plot()
+
+    print("Creating 2D colormap plot...")
     fig_2d, ax_2d = create_cmap_2d_plot()
     
-    # Show interactive 2D plot as well
     print("\nCreating interactive plot...")
     create_interactive_plot()
     
-    # Display all plots
     plt.show()
-    
