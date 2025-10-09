@@ -244,9 +244,9 @@ class SASModel:
         total_gain = along_track_gain + multilook_gain + sidelobe_suppression
         
         # Practical systems achieve 10-15 dB typical processing gain
-        if total_gain > 15:
-            print(f"Warning: Processing gain is higher than realistic: {total_gain} dB > 15 dB")
-        return min(total_gain, 15)  # 15 dB maximum realistic gain
+        if total_gain > 30:
+            print(f"Warning: Processing gain is higher than realistic: {total_gain} dB > 30 dB")
+        return min(total_gain, 30)  # 30 dB maximum realistic gain
     
     def calculate_cavitation_limit(self, frequency, depth=50):
         """
@@ -731,8 +731,8 @@ def create_3d_surface_plot():
     fixed_vehicle_speed = 2.0
     fixed_motion_error = 0.1
     
-    target_diameters = np.logspace(-3, 0, 100)
-    frequencies = np.linspace(10000, 200000, 100)
+    target_diameters = np.logspace(-2, 0, 100)
+    frequencies = np.linspace(20000, 200000, 100)
     
     TARGET_MESH, FREQ_MESH = np.meshgrid(target_diameters, frequencies)
     
@@ -824,8 +824,8 @@ def create_cmap_2d_plot():
     fixed_vehicle_speed = 1.0
     fixed_motion_error = 0.1
     
-    target_diameters = np.logspace(-2.7, 1.3, 400)
-    frequencies = np.linspace(40000, 200000, 300)
+    target_diameters = np.logspace(-2.7, 1.3, 600)
+    frequencies = np.linspace(40000, 200000, 400)
     
     TARGET_MESH, FREQ_MESH = np.meshgrid(target_diameters, frequencies)
     RANGE_MESH = np.zeros_like(TARGET_MESH)
