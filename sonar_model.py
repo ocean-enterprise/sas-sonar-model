@@ -228,7 +228,7 @@ class SASModel:
         
         # Along-track beamforming gain (main SAS advantage)
         # This represents coherent integration over synthetic aperture
-        along_track_gain = 10 * np.log10(effective_aperture / self.physical_aperture)
+        along_track_gain = 10 * np.log10(effective_aperture / wavelength)
         
         # Additional incoherent processing gain from multi-look averaging
         # This is ONLY applicable if doing separate incoherent averaging after SAR processing
