@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
 Synthetic Aperture Sonar (SAS) Detection Range Model
+
+Written by: Jeremy Karst, jeremy@karsttech.com, 2025-09-10
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
-from scipy.special import spherical_jn, spherical_yn
+# Built-in libraries
 import warnings
 from multiprocessing import Pool, cpu_count
-warnings.filterwarnings('ignore')
 
-import tqdm
+# External libraries
+import numpy as np # Array math
+from scipy.special import spherical_jn, spherical_yn # Spherical Bessel functions
+import matplotlib.pyplot as plt # Plotting
+from matplotlib.widgets import Slider
+import tqdm # Progress bar
+
+warnings.filterwarnings('ignore')
 
 colormap = 'gist_earth'
 
@@ -41,6 +46,7 @@ class SASModel:
         self.salinity = 35  # ppt
         self.ph = 8.1  # typical seawater
         self.sea_state = 3  # moderate seas
+        self.depth = 50  # m
         
         # SAS carrier frequencies for analysis (Hz)
         self.frequencies = {
@@ -50,6 +56,8 @@ class SASModel:
             '150 kHz': 150000,
             '200 kHz': 200000
         }
+
+        self.iterations = 20 # More iterations for better convergence and more computation time
         
         self.colors = ['#8884d8', '#82ca9d', '#ffc658', '#ff7300', '#8dd1e1']
     
@@ -243,7 +251,7 @@ class SASModel:
         # Total processing gain
         total_gain = along_track_gain + multilook_gain + sidelobe_suppression
         
-        # Practical systems achieve 10-15 dB typical processing gain
+        # Practical SAS systems achieve 15-30 dB typical processing gain
         if total_gain > 30:
             print(f"Warning: Processing gain is higher than realistic: {total_gain} dB > 30 dB")
         return min(total_gain, 30)  # 30 dB maximum realistic gain
@@ -276,43 +284,80 @@ class SASModel:
         
         return max_sl
     
-    def calculate_seawater_absorption(self, frequency_hz):
+    def calculate_seawater_absorption(self, frequency_hz, depth_m=None):
         """
-        Francois & Garrison model with environmental parameters including pH
-        http://resource.npl.co.uk/acoustics/techguides/seaabsorption/
+        Ainslie & McColm (1998) model for seawater sound absorption
+        A simplified formula for viscous and chemical absorption in sea water
+        
+        Reference:
+        Ainslie M.A., McColm J.G., "A simplified formula for viscous and chemical 
+        absorption in sea water", J. Acoust. Soc. Am., 103(3), 1671-1672, 1998.
+        http://resource.npl.co.uk/acoustics/techguides/seaabsorption/physics.html
         
         Args:
             frequency_hz: Frequency in Hz
-        
+            depth_m: Depth in meters (optional, uses self.depth if not provided)
+            
         Returns:
             Absorption coefficient (dB/km)
         """
-        f_khz = frequency_hz / 1000
+        # Convert frequency to kHz
+        f = frequency_hz / 1000
+        
+        # Get environmental parameters
         T = self.water_temperature  # °C
         S = self.salinity  # ppt
         pH = self.ph
+        D = depth_m if depth_m is not None else getattr(self, 'depth', 0)  # meters
         
-        # Boric acid relaxation frequency (with pH dependence)
+        # Temperature in Kelvin
+        T_kel = T + 273.0
+        
+        # Pressure in atmospheres (approximation from depth)
+        # P ≈ 1 + D/10 for depth in meters
+        P = 1.0 + D / 10.0
+        
+        # BORIC ACID CONTRIBUTION
+        # Coefficient A1 (pressure independent in A&M)
         A1 = 8.86 / self.sound_speed * 10**(0.78 * pH - 5)
-        P1 = 1  # Pressure in atmospheres (shallow water)
-        f1 = 2.8 * np.sqrt(S / 35) * 10**(4 - 1245 / (T + 273))
         
-        # Boric acid absorption
-        absorption1 = (A1 * P1 * f1 * f_khz**2) / (f1**2 + f_khz**2)
+        # Pressure factor for boric acid
+        P1 = 1.0
         
-        # Magnesium sulfate relaxation
+        # Boric acid relaxation frequency (kHz)
+        f1 = 2.8 * np.sqrt(S / 35) * 10**(4 - 1245 / T_kel)
+        
+        # Boric acid absorption term
+        boric_acid = (A1 * P1 * f1 * f**2) / (f1**2 + f**2)
+        
+        # MAGNESIUM SULFATE CONTRIBUTION
+        # Coefficient A2 (temperature dependent)
         A2 = 21.44 * S / self.sound_speed * (1 + 0.025 * T)
-        P2 = 1 - 1.37e-4 * 50 + 6.2e-9 * 50**2  # Depth = 50m
-        f2 = 8.17 * 10**(8 - 1990 / (T + 273)) / (1 + 0.0018 * (S - 35))
         
-        # Magnesium sulfate absorption
-        absorption2 = (A2 * P2 * f2 * f_khz**2) / (f2**2 + f_khz**2)
+        # Pressure factor for MgSO4 (depth dependent)
+        P2 = 1 - 1.37e-4 * D + 6.2e-9 * D**2
         
-        # Pure water absorption
-        A3 = 4.937e-4 - 2.59e-5 * T + 9.11e-7 * T**2 - 1.5e-8 * T**3
-        absorption3 = A3 * P2 * f_khz**2
+        # MgSO4 relaxation frequency (kHz)
+        f2 = 8.17 * 10**(8 - 1990 / T_kel) / (1 + 0.0018 * (S - 35))
         
-        total_absorption = absorption1 + absorption2 + absorption3
+        # MgSO4 absorption term
+        magnesium_sulfate = (A2 * P2 * f2 * f**2) / (f2**2 + f**2)
+        
+        # PURE WATER CONTRIBUTION (viscous absorption)
+        # Coefficient A3 (temperature dependent)
+        if T <= 20:
+            A3 = 4.937e-4 - 2.59e-5 * T + 9.11e-7 * T**2 - 1.5e-8 * T**3
+        else:
+            A3 = 3.964e-4 - 1.146e-5 * T + 1.45e-7 * T**2 - 6.5e-10 * T**3
+        
+        # Pressure factor for pure water
+        P3 = 1 - 3.83e-5 * D + 4.9e-10 * D**2
+        
+        # Pure water absorption term
+        pure_water = A3 * P3 * f**2
+        
+        # TOTAL ABSORPTION (dB/km)
+        total_absorption = boric_acid + magnesium_sulfate + pure_water
         
         return total_absorption
     
@@ -524,18 +569,18 @@ class SASModel:
 
         return min(total_degradation, 12)  # Realistic maximum degradation
     
-    def calculate_energy_constraint(self, sonar_power, vehicle_speed):
-        """
-        Calculate energy constraint penalty
-        """
-        propulsion_power = (0.5 * self.seawater_density * self.frontal_area * 
-                           self.drag_coefficient * vehicle_speed**3) / self.propulsion_efficiency
+    # def calculate_energy_constraint(self, sonar_power, vehicle_speed):
+    #     """
+    #     Calculate energy constraint penalty
+    #     """
+    #     propulsion_power = (0.5 * self.seawater_density * self.frontal_area * 
+    #                        self.drag_coefficient * vehicle_speed**3) / self.propulsion_efficiency
         
-        total_power = sonar_power + propulsion_power + self.hotel_load
+    #     total_power = sonar_power + propulsion_power + self.hotel_load
         
-        if total_power > self.max_power_budget:
-            return -(total_power - self.max_power_budget) / 50
-        return 0
+    #     if total_power > self.max_power_budget:
+    #         return (total_power - self.max_power_budget) / self.max_power_budget * 20 # 20 db for every 100% over budget
+    #     return 0
     
     def calculate_sas_range(self, electrical_power, frequency, vehicle_speed, 
                            motion_error_percent, target_size):
@@ -559,7 +604,10 @@ class SASModel:
         tolerance = 5.0  # meters
         
         def calculate_signal_excess(range_m):
-            """Calculate signal excess at given range"""
+            """Calculate signal excess at given range
+            
+            Modified for SAS properties from https://courses.washington.edu/fish538/lectureNotes/Sonar%20Equation%20Biol%203.pdf
+            """
             # Range-dependent parameters
             effective_aperture = self.calculate_effective_aperture(
                 range_m, vehicle_speed, motion_error_percent, frequency
@@ -576,9 +624,11 @@ class SASModel:
             # Target strength
             target_strength = self.calculate_target_strength(frequency, target_size)
             
-            # Transmission loss (spherical spreading + absorption)
-            absorption_coeff = self.calculate_seawater_absorption(frequency)
-            transmission_loss = 40 * np.log10(range_m) + 2 * absorption_coeff * range_m / 1000
+            # Transmission loss (conical spreading + absorption)
+            absorption_coeff = self.calculate_seawater_absorption(frequency) # dB / km
+            conical_spreading_loss = 40 * np.log10(range_m) # dB
+            absorption_loss = 2 * absorption_coeff * range_m / 1000
+            transmission_loss = conical_spreading_loss + absorption_loss
             
             # Receive directivity
             receive_di = self.calculate_directivity_index(frequency, effective_aperture)
@@ -605,25 +655,24 @@ class SASModel:
                 frequency, vehicle_speed, motion_error_percent, effective_aperture
             )
             
-            energy_penalty = self.calculate_energy_constraint(electrical_power, vehicle_speed)
+            # energy_penalty = self.calculate_energy_constraint(electrical_power, vehicle_speed)
             
             # Sonar equation
-            signal_excess = (source_level + target_strength - transmission_loss + 
-                           receive_di - total_noise + processing_gain - 
-                           self.detection_threshold - motion_degradation + energy_penalty)
+            signal_excess = source_level + target_strength - transmission_loss - total_noise - motion_degradation + processing_gain + receive_di
             
             return signal_excess
         
         # Bisection search
-        for iteration in range(30):
+        for _ in range(self.iterations):
             range_mid = (range_min + range_max) / 2
             
             if range_max - range_min < tolerance:
                 break
             
             signal_excess_mid = calculate_signal_excess(range_mid)
+            detection_level = signal_excess_mid - self.detection_threshold
             
-            if signal_excess_mid > 0:
+            if detection_level > 0:
                 # Can detect farther
                 range_min = range_mid
             else:
