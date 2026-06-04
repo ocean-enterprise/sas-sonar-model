@@ -7,7 +7,8 @@ Written by: Jeremy Karst, jeremy@karsttech.com, 2025-09-10
 
 # Built-in libraries
 import warnings
-from multiprocessing import Pool, cpu_count
+
+from utilities import parallel_map, thread_count
 
 # External libraries
 import numpy as np # Array math
@@ -681,11 +682,15 @@ class SASModel:
         
         return min((range_min + range_max) / 2, 8000)
 
+_worker_model = None
+
+
 def _calculate_range_worker(args):
-    """Worker function for multiprocessing pool"""
+    global _worker_model
+    if _worker_model is None:
+        _worker_model = SASModel()
     target_size, frequency, electrical_power, vehicle_speed, motion_error = args
-    model = SASModel()
-    return model.calculate_sas_range(
+    return _worker_model.calculate_sas_range(
         electrical_power, frequency, vehicle_speed, motion_error, target_size
     )
 
@@ -785,7 +790,7 @@ def create_3d_surface_plot():
     
     TARGET_MESH, FREQ_MESH = np.meshgrid(target_diameters, frequencies)
     
-    print(f"Calculating detection ranges for 3D surface using {cpu_count()} cores...")
+    print(f"Calculating detection ranges for 3D surface using {thread_count} cores...")
     RANGE_MESH = np.zeros_like(TARGET_MESH)
     
     args_list = []
@@ -796,9 +801,10 @@ def create_3d_surface_plot():
             args_list.append((target_size, frequency, fixed_electrical_power, 
                             fixed_vehicle_speed, fixed_motion_error))
     
-    with Pool() as pool:
-        results = pool.map(_calculate_range_worker, args_list)
-    
+    with tqdm.tqdm(total=len(args_list)) as bar:
+        results = parallel_map(
+            _calculate_range_worker, args_list, progress_bar=bar
+        )
     RANGE_MESH = np.array(results).reshape(TARGET_MESH.shape)
     print("100% complete")
     
@@ -872,14 +878,14 @@ def create_cmap_2d_plot():
     fixed_electrical_power = 50.0
     fixed_vehicle_speed = 1.0
     fixed_motion_error = 0.1
+    colorbar_max_range = 2000 # meters
     
-    target_diameters = np.logspace(-2.7, 1.3, 600)
-    frequencies = np.linspace(40000, 200000, 400)
+    target_diameters = np.logspace(-2.7, 1.3, 400)
+    frequencies = np.linspace(40000, 200000, 300)
     
     TARGET_MESH, FREQ_MESH = np.meshgrid(target_diameters, frequencies)
     RANGE_MESH = np.zeros_like(TARGET_MESH)
     
-    thread_count = cpu_count() // 2 
     print(f"Calculating detection ranges for 2D plot using {thread_count} cores...")
     
     args_list = []
@@ -890,18 +896,17 @@ def create_cmap_2d_plot():
             args_list.append((target_size, frequency, fixed_electrical_power,
                             fixed_vehicle_speed, fixed_motion_error))
     
-    results = []
-    with Pool(thread_count) as pool:
-        for r in tqdm.tqdm(pool.imap(_calculate_range_worker, args_list), total=len(args_list)):
-            results.append(r)
-    
+    with tqdm.tqdm(total=len(args_list)) as bar:
+        results = parallel_map(
+            _calculate_range_worker, args_list, progress_bar=bar
+        )
     RANGE_MESH = np.array(results).reshape(TARGET_MESH.shape)
     print("100% complete")
     
     fig, ax = plt.subplots(figsize=(12, 8))
     
     im = ax.pcolormesh(TARGET_MESH, FREQ_MESH/1000, RANGE_MESH, 
-                       cmap=colormap, shading='gouraud')
+                       cmap=colormap, shading='gouraud', vmin=0, vmax=colorbar_max_range)
     
     colorbar = fig.colorbar(im, ax=ax)
     colorbar.set_label('Detection Range (m)', fontsize=11)
@@ -946,6 +951,7 @@ def create_cmap_2d_plot():
     ax.legend(loc='upper right', fontsize=9)
     
     plt.tight_layout()
+
     return fig, ax
 
 if __name__ == "__main__":
